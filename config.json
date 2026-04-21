@@ -1,0 +1,44 @@
+{
+    "provider_id": {
+        "title": "API提供商 (优先)",
+        "description": "选择配置好的大模型提供商。如果选择此项，将忽略下方的API URL和Key",
+        "type": "string",
+        "default": ""
+    },
+    "api_url": {
+        "title": "手动配置: API URL",
+        "description": "生图API地址（如 /v1/chat/completions 或 /v1/images/generations）",
+        "type": "string",
+        "default": ""
+    },
+    "api_key": {
+        "title": "手动配置: API Key",
+        "description": "你的API Key",
+        "type": "string",
+        "default": ""
+    },
+    "model": {
+        "title": "模型名称",
+        "description": "使用的生图模型",
+        "type": "string",
+        "default": "free-gpt-5.4-all"
+    },
+    "download_timeout": {
+        "title": "图片下载超时时间（秒）",
+        "description": "从 API 获得图片 URL 后尝试下载的超时时间。如果生成的图片 CDN 较慢，建议调大此值。",
+        "type": "integer",
+        "default": 60
+    },
+    "download_retries": {
+        "title": "图片下载重试次数",
+        "description": "当下载失败（如超时或网络波动）时，插件会自动重试的次数。",
+        "type": "integer",
+        "default": 3
+    },
+    "api_timeout": {
+        "title": "API请求等待超时时间（秒）",
+        "description": "向生图API发送请求后等待返回结果的最大时间。生图模型通常需要较长时间处理，如频繁超时请调大此值。",
+        "type": "integer",
+        "default": 120
+    }
+}

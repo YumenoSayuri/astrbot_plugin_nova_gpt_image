@@ -1,0 +1,6 @@
+name: "astrbot_plugin_nova_gpt_image"
+desc: "支持模型上游非流式和流式生图，支持多模态图生图"
+help: "使用 /GPT生图 [描述] 来生图。详细请看配置面板和README。"
+version: "2.0.0"
+author: "Nova"
+repo: "https://github.com/YumenoSayuri/astrbot_plugin_nova_gpt_image"
