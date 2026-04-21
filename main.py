@@ -37,9 +37,9 @@ class NovaGptImagePlugin(Star):
             if not self.session.closed:
                 await self.session.close()
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        self.config = context.get_config().get("astrbot_plugin_nova_gpt_image", {})
+        self.config = config if config is not None else context.get_config().get("astrbot_plugin_nova_gpt_image", {})
         
         self.provider_id = self.config.get("provider_id", "")
         self.manual_api_url = self.config.get("api_url", "")
