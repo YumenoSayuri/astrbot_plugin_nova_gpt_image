@@ -3,7 +3,8 @@
         "title": "API提供商 (优先)",
         "description": "选择配置好的大模型提供商。如果选择此项，将忽略下方的API URL和Key",
         "type": "string",
-        "default": ""
+        "default": "",
+        "_special": "select_provider"
     },
     "api_url": {
         "title": "手动配置: API URL",

@@ -98,16 +98,12 @@ class NovaGptImagePlugin(Star):
 
     @filter.command("GPT生图", alias=["GPT"])
     async def gpt_draw_command(self, event: AstrMessageEvent, *, prompt: str = ""):
-        '''调用 GPT 生图。用法: /GPT生图 [描述内容] (支持带图片进行图生图)'''
         if not prompt:
-            # 尝试从 message_str 直接解析，兼容中间有空格的情况
-            cmd = "/GPT生图"
             if "/GPT生图" in event.message_str:
                 prompt = event.message_str.split("/GPT生图", 1)[1].strip()
             elif "/GPT" in event.message_str:
                 prompt = event.message_str.split("/GPT", 1)[1].strip()
             
-            # 清理 at 等信息
             prompt = re.sub(r'@\S+?\(\d+\)', '', prompt).strip()
             prompt = re.sub(r'@\S+', '', prompt).strip()
 
@@ -124,38 +120,107 @@ class NovaGptImagePlugin(Star):
         
         img_bytes_list = await self.extract_images_from_event(event)
 
-        messages_content = []
-        if img_bytes_list:
-            for b in img_bytes_list[:3]:
-                b64 = base64.b64encode(b).decode("utf-8")
-                messages_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64}"}
-                })
+        url_lower = api_url.lower()
         
-        messages_content.append({"type": "text", "text": f"画{prompt}"})
+        # 智能路由：图生图一律走 chat/completions；只有纯文生图且显式填了 images/generations 才走 images 体系。
+        is_images_api = False
         
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": messages_content}],
-            "stream": True
-        }
-
+        if ("images/generations" in url_lower or "images/edits" in url_lower) and not img_bytes_list:
+            is_images_api = True
+            logger.info(f"[NovaGptImage] 纯文生图，保留 Image API 端点: {api_url}")
+        
+        # 只要带有图片，或者原本就没写 images 端点，统统修正为 chat/completions
+        if not is_images_api:
+             if "images/generations" in url_lower or "images/edits" in url_lower:
+                 api_url = api_url.split("/v1/images/")[0] + "/v1/chat/completions"
+                 logger.info(f"[NovaGptImage] 检测到多模态图生图请求，已强制切换至通用 Chat API 端点: {api_url}")
+             elif not url_lower.endswith("/chat/completions"):
+                 api_url = api_url.rstrip("/") + "/v1/chat/completions"
+            
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        
-        if not api_url.endswith("/chat/completions") and not api_url.endswith("/images/generations") and not api_url.endswith("/images/edits"):
-            api_url = api_url.rstrip("/") + "/v1/chat/completions"
 
-        try:
-            async for result in self._stream_request(event, api_url, headers, payload):
-                yield result
-        except Exception as e:
-            yield event.plain_result(f"画图出错啦：{str(e)}")
+        if is_images_api:
+            # 纯文生图，适配 v1/images/generations (DALL-E 风格)
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "n": 1,
+                "size": "1024x1024"
+            }
+            try:
+                logger.info(f"[NovaGptImage] Calling Image API: {api_url}")
+                async for result in self._non_stream_request(event, api_url, headers, payload):
+                    yield result
+            except Exception as e:
+                yield event.plain_result(f"画图出错啦：{str(e)}")
+        else:
+            # 走 chat/completions 体系 (多模态通用)
+            messages_content = []
+            if img_bytes_list:
+                for b in img_bytes_list[:3]:
+                    b64 = base64.b64encode(b).decode("utf-8")
+                    # 使用标准的前缀来让大部分视觉模型识别
+                    messages_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"}
+                    })
+            messages_content.append({"type": "text", "text": f"画{prompt}"})
+            
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": messages_content}],
+                "stream": True # 默认开启流式，如果上游假流式，后续会自动兜底提取 json
+            }
+            
+            try:
+                logger.info(f"[NovaGptImage] Calling Chat API: {api_url}")
+                async for result in self._stream_request(event, api_url, headers, payload):
+                    yield result
+            except Exception as e:
+                yield event.plain_result(f"画图出错啦：{str(e)}")
+
+
+    async def _non_stream_request(self, event: AstrMessageEvent, url: str, headers: dict, payload: dict):
+        """专门处理直接返回 JSON 结果的图像接口 (如 v1/images/generations)"""
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(url, headers=headers, json=payload, timeout=self.api_timeout) as response:
+                    if response.status != 200:
+                        text = await response.text()
+                        yield event.plain_result(f"API 请求失败: HTTP {response.status}\n{text}")
+                        return
+                    
+                    data = await response.json()
+                    
+                    # 尝试解析 openai 风格的 data[0].url
+                    if isinstance(data.get("data"), list) and len(data["data"]) > 0:
+                        img_url = data["data"][0].get("url")
+                        if img_url:
+                            img_bytes = await self.downloader.download(img_url)
+                            if img_bytes:
+                                yield event.make_result().message(Image.fromBytes(img_bytes))
+                                return
+                            else:
+                                yield event.plain_result(f"生成成功，但下载失败惹...\n链接: {img_url}")
+                                return
+                                
+                    # 尝试解析 openai 风格的 data[0].b64_json
+                    if isinstance(data.get("data"), list) and len(data["data"]) > 0:
+                        b64_json = data["data"][0].get("b64_json")
+                        if b64_json:
+                            img_bytes = base64.b64decode(b64_json)
+                            yield event.make_result().message(Image.fromBytes(img_bytes))
+                            return
+
+                    yield event.plain_result(f"未能从响应中提取图片，返回内容: {str(data)[:200]}")
+            except asyncio.TimeoutError:
+                yield event.plain_result(f"API 请求超时啦，请在配置中调大超时时间（当前 {self.api_timeout} 秒）")
 
     async def _stream_request(self, event: AstrMessageEvent, url: str, headers: dict, payload: dict):
+        """处理流式和可能的伪流式 chat/completions"""
         buffer = ""
         image_pattern = re.compile(r'!\[.*?\]\((.*?)\)')
         yielded_urls = set()
@@ -168,6 +233,24 @@ class NovaGptImagePlugin(Star):
                         yield event.plain_result(f"API 请求失败: HTTP {response.status}\n{text}")
                         return
 
+                    # 检查是否是真的流式响应
+                    content_type = response.headers.get("Content-Type", "")
+                    if "text/event-stream" not in content_type:
+                         # 有些接口就算传了 stream=True 也会一次性返回 json
+                         data = await response.json()
+                         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                         if content:
+                             matches = image_pattern.findall(content)
+                             if matches:
+                                 for img_url in matches:
+                                     img_bytes = await self.downloader.download(img_url)
+                                     if img_bytes: yield event.make_result().message(Image.fromBytes(img_bytes))
+                                     else: yield event.plain_result(f"下载失败: {img_url}")
+                                 return
+                         yield event.plain_result(f"非流式返回中未找到图片惹...\n详情：{str(data)[:100]}")
+                         return
+
+                    # 真正的流式处理
                     async for line in response.content:
                         line = line.decode('utf-8').strip()
                         if not line: continue
