@@ -201,7 +201,7 @@ class NovaGptImagePlugin(Star):
                         if img_url:
                             img_bytes = await self.downloader.download(img_url)
                             if img_bytes:
-                                yield event.make_result().message(Image.fromBytes(img_bytes))
+                                yield event.chain_result([Image.fromBytes(img_bytes)])
                                 return
                             else:
                                 yield event.plain_result(f"生成成功，但下载失败惹...\n链接: {img_url}")
@@ -212,7 +212,7 @@ class NovaGptImagePlugin(Star):
                         b64_json = data["data"][0].get("b64_json")
                         if b64_json:
                             img_bytes = base64.b64decode(b64_json)
-                            yield event.make_result().message(Image.fromBytes(img_bytes))
+                            yield event.chain_result([Image.fromBytes(img_bytes)])
                             return
 
                     yield event.plain_result(f"未能从响应中提取图片，返回内容: {str(data)[:200]}")
@@ -244,7 +244,7 @@ class NovaGptImagePlugin(Star):
                              if matches:
                                  for img_url in matches:
                                      img_bytes = await self.downloader.download(img_url)
-                                     if img_bytes: yield event.make_result().message(Image.fromBytes(img_bytes))
+                                     if img_bytes: yield event.chain_result([Image.fromBytes(img_bytes)])
                                      else: yield event.plain_result(f"下载失败: {img_url}")
                                  return
                          yield event.plain_result(f"非流式返回中未找到图片惹...\n详情：{str(data)[:100]}")
@@ -269,7 +269,7 @@ class NovaGptImagePlugin(Star):
                                             yielded_urls.add(img_url)
                                             img_bytes = await self.downloader.download(img_url)
                                             if img_bytes:
-                                                yield event.make_result().message(Image.fromBytes(img_bytes))
+                                                yield event.chain_result([Image.fromBytes(img_bytes)])
                                             else:
                                                 yield event.plain_result(f"图片生成成功，但下载超时或失败惹...\n链接: {img_url}")
                             except json.JSONDecodeError:
