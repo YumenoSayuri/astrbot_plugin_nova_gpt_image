@@ -97,15 +97,21 @@ class NovaGptImagePlugin(Star):
         return img_bytes_list
 
     @filter.command("GPT生图", alias=["GPT"])
-    async def gpt_draw_command(self, event: AstrMessageEvent, *, prompt: str = ""):
+    async def gpt_draw_command(self, event: AstrMessageEvent, message: str = ""):
+        # 使用最标准的 AstrBot V4 参数签名，接受框架传入的剩余文本作为 message
+        prompt = message.strip()
+        
+        # 如果 message 为空（有时候框架分割有问题），兜底从原始字符串提取
         if not prompt:
-            if "/GPT生图" in event.message_str:
-                prompt = event.message_str.split("/GPT生图", 1)[1].strip()
-            elif "/GPT" in event.message_str:
-                prompt = event.message_str.split("/GPT", 1)[1].strip()
-            
-            prompt = re.sub(r'@\S+?\(\d+\)', '', prompt).strip()
-            prompt = re.sub(r'@\S+', '', prompt).strip()
+            msg_str = event.message_str
+            if "/GPT生图" in msg_str:
+                prompt = msg_str.split("/GPT生图", 1)[1].strip()
+            elif "/GPT" in msg_str:
+                prompt = msg_str.split("/GPT", 1)[1].strip()
+        
+        # 清除任何残留的 @ 文本
+        prompt = re.sub(r'@\S+?\(\d+\)', '', prompt).strip()
+        prompt = re.sub(r'@\S+', '', prompt).strip()
 
         if not prompt:
             yield event.plain_result("请告诉我你想画什么呀，辉宝主人~ (可以带图片哦)")
@@ -116,7 +122,7 @@ class NovaGptImagePlugin(Star):
             yield event.plain_result("未配置 API URL 或 Key，请在面板中设置提供商或手动填写哦~")
             return
             
-        yield event.plain_result(f"Nova 正在为您生成「{prompt[:15]}...」，请稍候...")
+        yield event.plain_result(f"正在用gpt-image-2为您生成「{prompt[:15]}...」，请稍候...")
         
         img_bytes_list = await self.extract_images_from_event(event)
 
@@ -238,7 +244,11 @@ class NovaGptImagePlugin(Star):
                     if "text/event-stream" not in content_type:
                          # 有些接口就算传了 stream=True 也会一次性返回 json
                          data = await response.json()
-                         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                         choices = data.get("choices", [])
+                         content = ""
+                         if choices and len(choices) > 0:
+                             content = choices[0].get("message", {}).get("content", "")
+                         
                          if content:
                              matches = image_pattern.findall(content)
                              if matches:
@@ -259,10 +269,12 @@ class NovaGptImagePlugin(Star):
                         if line.startswith("data: "):
                             try:
                                 data_json = json.loads(line[6:])
-                                delta = data_json.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    buffer += content
+                                choices = data_json.get("choices", [])
+                                if choices and len(choices) > 0:
+                                    delta = choices[0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    if content:
+                                        buffer += content
                                     matches = image_pattern.findall(buffer)
                                     for img_url in matches:
                                         if img_url not in yielded_urls:
