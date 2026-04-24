@@ -128,20 +128,15 @@ class NovaGptImagePlugin(Star):
 
         url_lower = api_url.lower()
         
-        # 智能路由：图生图一律走 chat/completions；只有纯文生图且显式填了 images/generations 才走 images 体系。
+        # 严格尊崇用户填写的端点，不做越权拦截
         is_images_api = False
-        
-        if ("images/generations" in url_lower or "images/edits" in url_lower) and not img_bytes_list:
+        if "images/generations" in url_lower or "images/edits" in url_lower or "images/" in url_lower:
             is_images_api = True
-            logger.info(f"[NovaGptImage] 纯文生图，保留 Image API 端点: {api_url}")
-        
-        # 只要带有图片，或者原本就没写 images 端点，统统修正为 chat/completions
-        if not is_images_api:
-             if "images/generations" in url_lower or "images/edits" in url_lower:
-                 api_url = api_url.split("/v1/images/")[0] + "/v1/chat/completions"
-                 logger.info(f"[NovaGptImage] 检测到多模态图生图请求，已强制切换至通用 Chat API 端点: {api_url}")
-             elif not url_lower.endswith("/chat/completions"):
-                 api_url = api_url.rstrip("/") + "/v1/chat/completions"
+            logger.info(f"[NovaGptImage] 匹配到 Image API 端点: {api_url}")
+        elif not url_lower.endswith("/chat/completions"):
+            # 仅在非 images 且未写明 chat/completions 时补全
+            api_url = api_url.rstrip("/") + "/v1/chat/completions"
+            logger.info(f"[NovaGptImage] 补全 Chat API 端点: {api_url}")
             
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -149,13 +144,21 @@ class NovaGptImagePlugin(Star):
         }
 
         if is_images_api:
-            # 纯文生图，适配 v1/images/generations (DALL-E 风格)
+            # 适配 v1/images/generations 体系 (支持内嵌 image 数组的图生图)
             payload = {
                 "model": model,
                 "prompt": prompt,
                 "n": 1,
                 "size": "1024x1024"
             }
+            if img_bytes_list:
+                img_urls = []
+                for b in img_bytes_list[:3]:
+                    b64 = base64.b64encode(b).decode("utf-8")
+                    img_urls.append(f"data:image/png;base64,{b64}")
+                payload["image"] = img_urls
+                logger.info("[NovaGptImage] Image API 图生图模式，已注入 Base64 图像数组")
+                
             try:
                 logger.info(f"[NovaGptImage] Calling Image API: {api_url}")
                 async for result in self._non_stream_request(event, api_url, headers, payload):
