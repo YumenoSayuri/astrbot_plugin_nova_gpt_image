@@ -15,7 +15,8 @@ from astrbot.core.provider import Provider
 class NovaGptImagePlugin(Star):
     class ImageDownloader:
         def __init__(self, timeout: int = 60, retries: int = 3):
-            self.session = aiohttp.ClientSession()
+            # 将缓冲区提升到 100MB 应对超大 4K 图片
+            self.session = aiohttp.ClientSession(read_bufsize=1024 * 1024 * 100)
             self.timeout = timeout
             self.retries = retries
 
@@ -82,32 +83,47 @@ class NovaGptImagePlugin(Star):
             return await self.downloader.download(image_comp.url)
         return None
 
-    async def extract_images_from_event(self, event: AstrMessageEvent) -> List[bytes]:
+    async def extract_images_from_event(self, event: AstrMessageEvent) -> tuple[List[bytes], List[str]]:
         img_bytes_list = []
+        img_urls_list = []
+        
+        async def process_image_seg(img_seg: Image):
+            # 提取 bytes，用于兜底 chat/completions base64
+            if img := await self._image_component_to_bytes(img_seg):
+                img_bytes_list.append(img)
+            # 提取原始 url，用于 generations 规避 chunk too big
+            if img_seg.url:
+                img_urls_list.append(img_seg.url)
+
         for seg in event.message_obj.message:
             if isinstance(seg, Reply) and seg.chain:
                 for s_chain in seg.chain:
                     if isinstance(s_chain, Image):
-                        if img := await self._image_component_to_bytes(s_chain):
-                            img_bytes_list.append(img)
+                        await process_image_seg(s_chain)
         for seg in event.message_obj.message:
             if isinstance(seg, Image):
-                if img := await self._image_component_to_bytes(seg):
-                    img_bytes_list.append(img)
-        return img_bytes_list
+                await process_image_seg(seg)
+                
+        return img_bytes_list, img_urls_list
 
     @filter.command("GPT生图", alias=["GPT"])
-    async def gpt_draw_command(self, event: AstrMessageEvent, message: str = ""):
-        # 使用最标准的 AstrBot V4 参数签名，接受框架传入的剩余文本作为 message
-        prompt = message.strip()
+    async def gpt_draw_command(self, event: AstrMessageEvent, prompt: str = ""):
+        # 直接使用底层字符串分割，完美保留第一个空格后的所有空格与内容
+        arg = event.message_str.partition(" ")[2].strip()
         
-        # 如果 message 为空（有时候框架分割有问题），兜底从原始字符串提取
-        if not prompt:
+        # 兜底：如果用户连空格都没打，比如直接回复了 /GPT生图画个猫
+        if not arg:
             msg_str = event.message_str
             if "/GPT生图" in msg_str:
-                prompt = msg_str.split("/GPT生图", 1)[1].strip()
+                arg = msg_str.split("/GPT生图", 1)[1].strip()
             elif "/GPT" in msg_str:
-                prompt = msg_str.split("/GPT", 1)[1].strip()
+                arg = msg_str.split("/GPT", 1)[1].strip()
+            elif "GPT生图" in msg_str:
+                arg = msg_str.split("GPT生图", 1)[1].strip()
+            elif "GPT" in msg_str:
+                arg = msg_str.split("GPT", 1)[1].strip()
+                
+        prompt = arg
         
         # 清除任何残留的 @ 文本
         prompt = re.sub(r'@\S+?\(\d+\)', '', prompt).strip()
@@ -122,9 +138,11 @@ class NovaGptImagePlugin(Star):
             yield event.plain_result("未配置 API URL 或 Key，请在面板中设置提供商或手动填写哦~")
             return
             
-        yield event.plain_result(f"正在用gpt-image-2为您生成「{prompt[:15]}...」，请稍候...")
+        # 移除任何模型提供商带的中文前缀（如 "鸢-"），如果指定的话。并优化文案。
+        display_model = re.sub(r'^[\u4e00-\u9fa5]+-', '', model)
+        yield event.plain_result(f"正在用 {display_model} 为您生成「{prompt[:15]}...」，请稍候...")
         
-        img_bytes_list = await self.extract_images_from_event(event)
+        img_bytes_list, img_urls_list = await self.extract_images_from_event(event)
 
         url_lower = api_url.lower()
         
@@ -151,13 +169,17 @@ class NovaGptImagePlugin(Star):
                 "n": 1,
                 "size": "1024x1024"
             }
-            if img_bytes_list:
-                img_urls = []
+            # 为了防止 Base64 造成 Chunk too big，优先直接传 URL，如果没 URL 才回退 Base64
+            if img_urls_list:
+                payload["image"] = img_urls_list[:3]
+                logger.info("[NovaGptImage] Image API 图生图模式，直接注入 URL 数组防过载")
+            elif img_bytes_list:
+                b64_urls = []
                 for b in img_bytes_list[:3]:
                     b64 = base64.b64encode(b).decode("utf-8")
-                    img_urls.append(f"data:image/png;base64,{b64}")
-                payload["image"] = img_urls
-                logger.info("[NovaGptImage] Image API 图生图模式，已注入 Base64 图像数组")
+                    b64_urls.append(f"data:image/png;base64,{b64}")
+                payload["image"] = b64_urls
+                logger.info("[NovaGptImage] Image API 图生图模式，注入 Base64 图像数组兜底")
                 
             try:
                 logger.info(f"[NovaGptImage] Calling Image API: {api_url}")
@@ -194,7 +216,8 @@ class NovaGptImagePlugin(Star):
 
     async def _non_stream_request(self, event: AstrMessageEvent, url: str, headers: dict, payload: dict):
         """专门处理直接返回 JSON 结果的图像接口 (如 v1/images/generations)"""
-        async with aiohttp.ClientSession() as session:
+        # 移除读取内容的大小限制，应对 4k 图片等返回超长 Base64 导致的 Chunk too big 问题
+        async with aiohttp.ClientSession(read_bufsize=1024 * 1024 * 100) as session:
             try:
                 async with session.post(url, headers=headers, json=payload, timeout=self.api_timeout) as response:
                     if response.status != 200:
@@ -234,7 +257,8 @@ class NovaGptImagePlugin(Star):
         image_pattern = re.compile(r'!\[.*?\]\((.*?)\)')
         yielded_urls = set()
         
-        async with aiohttp.ClientSession() as session:
+        # 对于流式请求，由于 Base64 图片可能在一行内返回，超过默认的 Chunk 大小限制，因此提升缓冲区到 100MB。
+        async with aiohttp.ClientSession(auto_decompress=True, read_bufsize=1024 * 1024 * 100) as session:
             try:
                 async with session.post(url, headers=headers, json=payload, timeout=self.api_timeout) as response:
                     if response.status != 200:
@@ -256,16 +280,24 @@ class NovaGptImagePlugin(Star):
                              matches = image_pattern.findall(content)
                              if matches:
                                  for img_url in matches:
-                                     img_bytes = await self.downloader.download(img_url)
-                                     if img_bytes: yield event.chain_result([Image.fromBytes(img_bytes)])
-                                     else: yield event.plain_result(f"下载失败: {img_url}")
+                                     if img_url.startswith("data:image/"):
+                                         try:
+                                             b64_data = img_url.split(",", 1)[1]
+                                             img_bytes = base64.b64decode(b64_data)
+                                             yield event.chain_result([Image.fromBytes(img_bytes)])
+                                         except Exception as e:
+                                             yield event.plain_result(f"Base64图片解析失败: {e}")
+                                     else:
+                                         img_bytes = await self.downloader.download(img_url)
+                                         if img_bytes: yield event.chain_result([Image.fromBytes(img_bytes)])
+                                         else: yield event.plain_result(f"下载失败: {img_url}")
                                  return
                          yield event.plain_result(f"非流式返回中未找到图片惹...\n详情：{str(data)[:100]}")
                          return
 
-                    # 真正的流式处理
-                    async for line in response.content:
-                        line = line.decode('utf-8').strip()
+                    # 真正的流式处理，由于已经提升了 read_bufsize，这里可以直接按行读取
+                    async for chunk in response.content:
+                        line = chunk.decode('utf-8').strip()
                         if not line: continue
                         if line == "data: [DONE]": break
                         
@@ -282,11 +314,19 @@ class NovaGptImagePlugin(Star):
                                     for img_url in matches:
                                         if img_url not in yielded_urls:
                                             yielded_urls.add(img_url)
-                                            img_bytes = await self.downloader.download(img_url)
-                                            if img_bytes:
-                                                yield event.chain_result([Image.fromBytes(img_bytes)])
+                                            if img_url.startswith("data:image/"):
+                                                try:
+                                                    b64_data = img_url.split(",", 1)[1]
+                                                    img_bytes = base64.b64decode(b64_data)
+                                                    yield event.chain_result([Image.fromBytes(img_bytes)])
+                                                except Exception as e:
+                                                    yield event.plain_result(f"Base64 图片解析失败: {e}")
                                             else:
-                                                yield event.plain_result(f"图片生成成功，但下载超时或失败惹...\n链接: {img_url}")
+                                                img_bytes = await self.downloader.download(img_url)
+                                                if img_bytes:
+                                                    yield event.chain_result([Image.fromBytes(img_bytes)])
+                                                else:
+                                                    yield event.plain_result(f"图片生成成功，但下载超时或失败惹...\n链接: {img_url}")
                             except json.JSONDecodeError:
                                 pass
             except asyncio.TimeoutError:
