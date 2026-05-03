@@ -41,5 +41,11 @@
         "description": "向生图API发送请求后等待返回结果的最大时间。生图模型通常需要较长时间处理，如频繁超时请调大此值。",
         "type": "int",
         "default": 120
+    },
+    "whitelist_qq": {
+        "title": "4K生图白名单（QQ号）",
+        "description": "允许使用4K高清生图的QQ号列表，多个QQ号用英文逗号分隔。白名单用户可在prompt中使用'4K'、'1:1'等关键词自动调整分辨率。非白名单用户将使用默认分辨率。",
+        "type": "string",
+        "default": ""
     }
 }

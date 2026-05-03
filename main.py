@@ -51,6 +51,15 @@ class NovaGptImagePlugin(Star):
         dl_retries = self.config.get("download_retries", 3)
         self.api_timeout = self.config.get("api_timeout", 120)
         
+        # 解析白名单 QQ 号
+        whitelist_str = self.config.get("whitelist_qq", "")
+        self.whitelist_qq = set()
+        if whitelist_str:
+            for qq in whitelist_str.split(","):
+                qq = qq.strip()
+                if qq:
+                    self.whitelist_qq.add(qq)
+        
         self.downloader = self.ImageDownloader(timeout=dl_timeout, retries=dl_retries)
 
     async def get_api_config(self) -> tuple[str, str, str]:
@@ -81,6 +90,76 @@ class NovaGptImagePlugin(Star):
                 logger.warning(f"获取图片 base64 失败: {e}")
         if image_comp.url:
             return await self.downloader.download(image_comp.url)
+        return None
+
+    def parse_size_from_prompt(self, prompt: str, is_whitelist: bool) -> str | None:
+        """
+        从 prompt 中智能解析尺寸参数
+        返回: 具体尺寸字符串（如 "3840x2160"）或 None（表示不传 size）
+        """
+        if not is_whitelist:
+            return None  # 非白名单用户不传 size
+        
+        prompt_lower = prompt.lower()
+        
+        # 提取质量关键词
+        quality = None
+        if "4k" in prompt_lower:
+            quality = "4k"
+        elif "2k" in prompt_lower:
+            quality = "2k"
+        elif "1k" in prompt_lower or "1080" in prompt_lower:
+            quality = "1k"
+        
+        # 提取比例关键词（支持多种写法）
+        ratio = None
+        # 匹配 1:1, 1：1, 1-1, 1比1 等
+        if re.search(r'1[:\：\-比]1', prompt):
+            ratio = "1:1"
+        elif re.search(r'16[:\：\-比]9', prompt):
+            ratio = "16:9"
+        elif re.search(r'9[:\：\-比]16', prompt):
+            ratio = "9:16"
+        elif re.search(r'4[:\：\-比]3', prompt):
+            ratio = "4:3"
+        elif re.search(r'3[:\：\-比]4', prompt):
+            ratio = "3:4"
+        elif re.search(r'3[:\：\-比]2', prompt):
+            ratio = "3:2"
+        elif re.search(r'2[:\：\-比]3', prompt):
+            ratio = "2:3"
+        
+        # 只有同时有质量和比例才返回具体尺寸
+        if quality and ratio:
+            size_map = {
+                ("4k", "16:9"): "3840x2160",
+                ("4k", "9:16"): "2160x3840",
+                ("4k", "1:1"): "2880x2880",
+                ("4k", "4:3"): "2560x1920",  # 约 4.9M 像素
+                ("4k", "3:4"): "1920x2560",
+                ("4k", "3:2"): "2880x1920",  # 约 5.5M 像素
+                ("4k", "2:3"): "1920x2880",
+                ("2k", "16:9"): "2560x1440",
+                ("2k", "9:16"): "1440x2560",
+                ("2k", "1:1"): "2048x2048",
+                ("2k", "4:3"): "1920x1440",
+                ("2k", "3:4"): "1440x1920",
+                ("2k", "3:2"): "2048x1365",  # 约 2.8M 像素
+                ("2k", "2:3"): "1365x2048",
+                ("1k", "16:9"): "1920x1080",
+                ("1k", "9:16"): "1080x1920",
+                ("1k", "1:1"): "1024x1024",
+                ("1k", "4:3"): "1280x960",
+                ("1k", "3:4"): "960x1280",
+                ("1k", "3:2"): "1440x960",
+                ("1k", "2:3"): "960x1440",
+            }
+            size = size_map.get((quality, ratio))
+            if size:
+                logger.info(f"[NovaGptImage] 智能识别尺寸: {quality} + {ratio} → {size}")
+                return size
+        
+        # 只有其中一个或都没有，不传 size
         return None
 
     async def extract_images_from_event(self, event: AstrMessageEvent) -> tuple[List[bytes], List[str]]:
@@ -163,12 +242,31 @@ class NovaGptImagePlugin(Star):
 
         if is_images_api:
             # 适配 v1/images/generations 体系 (支持内嵌 image 数组的图生图)
+            # 检查用户是否在白名单
+            user_qq = event.get_sender_id()
+            is_whitelist = user_qq in self.whitelist_qq
+            
+            # 智能解析尺寸
+            size = self.parse_size_from_prompt(prompt, is_whitelist)
+            
             payload = {
                 "model": model,
                 "prompt": prompt,
                 "n": 1,
-                "size": "1024x1024"
+                "output_format": "png",
+                "quality": "high"
             }
+            
+            # 只有白名单用户且识别到完整的质量+比例才传 size
+            if size:
+                payload["size"] = size
+                logger.info(f"[NovaGptImage] 白名单用户 {user_qq}，使用尺寸: {size}")
+            else:
+                if is_whitelist:
+                    logger.info(f"[NovaGptImage] 白名单用户 {user_qq}，但未识别到完整参数，使用默认尺寸")
+                else:
+                    logger.info(f"[NovaGptImage] 非白名单用户 {user_qq}，使用默认尺寸")
+            
             # 为了防止 Base64 造成 Chunk too big，优先直接传 URL，如果没 URL 才回退 Base64
             if img_urls_list:
                 payload["image"] = img_urls_list[:3]
@@ -314,18 +412,24 @@ class NovaGptImagePlugin(Star):
                                     for img_url in matches:
                                         if img_url not in yielded_urls:
                                             yielded_urls.add(img_url)
+                                            logger.info(f"[NovaGptImage] 检测到图片链接: {img_url[:100]}")
                                             if img_url.startswith("data:image/"):
                                                 try:
                                                     b64_data = img_url.split(",", 1)[1]
                                                     img_bytes = base64.b64decode(b64_data)
                                                     yield event.chain_result([Image.fromBytes(img_bytes)])
+                                                    logger.info("[NovaGptImage] Base64 图片发送成功")
                                                 except Exception as e:
+                                                    logger.error(f"[NovaGptImage] Base64 解析失败: {e}")
                                                     yield event.plain_result(f"Base64 图片解析失败: {e}")
                                             else:
+                                                logger.info(f"[NovaGptImage] 开始下载图片: {img_url}")
                                                 img_bytes = await self.downloader.download(img_url)
                                                 if img_bytes:
+                                                    logger.info(f"[NovaGptImage] 图片下载成功，大小: {len(img_bytes)} bytes")
                                                     yield event.chain_result([Image.fromBytes(img_bytes)])
                                                 else:
+                                                    logger.warning(f"[NovaGptImage] 图片下载失败: {img_url}")
                                                     yield event.plain_result(f"图片生成成功，但下载超时或失败惹...\n链接: {img_url}")
                             except json.JSONDecodeError:
                                 pass
