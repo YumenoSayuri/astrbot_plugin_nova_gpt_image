@@ -78,6 +78,45 @@ class NovaGptImagePlugin(Star):
                     logger.warning(f"[NovaGptImage] 从提供商获取配置失败: {e}")
         return self.manual_api_url, self.manual_api_key, self.model_name
 
+    async def select_route_config(self, is_whitelist: bool, has_images: bool) -> tuple[str, str, str]:
+        """
+        按四路策略选择配置：
+        1. 白名单图生图
+        2. 白名单文生图
+        3. 普通用户图生图
+        4. 普通用户文生图
+        任一路缺失时回退到旧 provider/manual 单路配置
+        """
+        route_url = ""
+        route_model = ""
+
+        if is_whitelist and has_images:
+            route_url = self.config.get("whitelist_i2i_api_url", "").strip()
+            route_model = self.config.get("whitelist_i2i_model", "").strip()
+        elif is_whitelist and not has_images:
+            route_url = self.config.get("whitelist_t2i_api_url", "").strip()
+            route_model = self.config.get("whitelist_t2i_model", "").strip()
+        elif (not is_whitelist) and has_images:
+            route_url = self.config.get("normal_i2i_api_url", "").strip()
+            route_model = self.config.get("normal_i2i_model", "").strip()
+        else:
+            route_url = self.config.get("normal_t2i_api_url", "").strip()
+            route_model = self.config.get("normal_t2i_model", "").strip()
+
+        fallback_url, fallback_key, fallback_model = await self.get_api_config()
+        api_url = route_url or fallback_url
+        api_key = self.manual_api_key or fallback_key
+        model = route_model or fallback_model
+
+        route_name = (
+            "白名单图生图" if is_whitelist and has_images else
+            "白名单文生图" if is_whitelist and not has_images else
+            "普通图生图" if (not is_whitelist) and has_images else
+            "普通文生图"
+        )
+        logger.info(f"[NovaGptImage] 路由选择: {route_name} | url={api_url} | model={model}")
+        return api_url, api_key, model
+
     async def _image_component_to_bytes(self, image_comp: Image) -> bytes | None:
         if hasattr(image_comp, "convert_to_base64"):
             try:
@@ -212,16 +251,20 @@ class NovaGptImagePlugin(Star):
             yield event.plain_result("请告诉我你想画什么呀，辉宝主人~ (可以带图片哦)")
             return
 
-        api_url, api_key, model = await self.get_api_config()
+        img_bytes_list, img_urls_list = await self.extract_images_from_event(event)
+        user_qq = event.get_sender_id()
+        is_whitelist = user_qq in self.whitelist_qq
+        has_images = bool(img_bytes_list or img_urls_list)
+
+        api_url, api_key, model = await self.select_route_config(is_whitelist, has_images)
         if not api_url or not api_key:
-            yield event.plain_result("未配置 API URL 或 Key，请在面板中设置提供商或手动填写哦~")
+            yield event.plain_result("未配置 API URL 或 Key，请在面板中设置对应路由、提供商或手动填写哦~")
             return
             
         # 移除任何模型提供商带的中文前缀（如 "鸢-"），如果指定的话。并优化文案。
         display_model = re.sub(r'^[\u4e00-\u9fa5]+-', '', model)
-        yield event.plain_result(f"正在用 {display_model} 为您生成「{prompt[:15]}...」，请稍候...")
-        
-        img_bytes_list, img_urls_list = await self.extract_images_from_event(event)
+        route_tip = "图生图" if has_images else "文生图"
+        yield event.plain_result(f"正在用 {display_model} ({route_tip}) 为您生成「{prompt[:15]}...」，请稍候...")
 
         url_lower = api_url.lower()
         
@@ -241,12 +284,8 @@ class NovaGptImagePlugin(Star):
         }
 
         if is_images_api:
-            # 适配 v1/images/generations 体系 (支持内嵌 image 数组的图生图)
-            # 检查用户是否在白名单
-            user_qq = event.get_sender_id()
-            is_whitelist = user_qq in self.whitelist_qq
-            
-            # 智能解析尺寸
+            # 适配 images 体系；若配置成 edits 也复用同一套请求发送
+            # 智能解析尺寸（仅对白名单生效）
             size = self.parse_size_from_prompt(prompt, is_whitelist)
             
             payload = {
